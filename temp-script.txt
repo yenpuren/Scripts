@@ -1,0 +1,494 @@
+<#
+.SYNOPSIS
+    Pre-Upgrade Diagnostic Information Collector for Windows Server
+    Generates a professional interactive HTML report with system diagnostics.
+
+.DESCRIPTION
+    This script collects comprehensive diagnostic information from Windows Server
+    for pre-upgrade assessments and outputs it to an interactive HTML report.
+
+.PARAMETER OutputPath
+    Path to save the HTML report. Defaults to current directory.
+
+.PARAMETER LogoUrl
+    URL for the company logo to include in the report header. Defaults to a placeholder.
+
+.EXAMPLE
+    .\PreUpgrade-FullInfo.ps1 -OutputPath "C:\Reports" -LogoUrl "https://btci.com/logo.png"
+
+.NOTES
+    Compatible with Windows Server 2016, 2019, 2022, 2025.
+    Requires administrative privileges for full data collection.
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $false)]
+    [ValidateScript({ Test-Path (Split-Path $_ -Parent) -PathType Container })]
+    [string]$OutputPath = ".\",
+
+    [Parameter(Mandatory = $false)]
+    [string]$LogoUrl = "https://via.placeholder.com/150x50/007BFF/FFFFFF?text=BTCI"
+)
+
+# Ensure running as Administrator
+if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    Write-Warning "Relaunching as Administrator..."
+    Start-Process PowerShell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -OutputPath `"$OutputPath`" -LogoUrl `"$LogoUrl`"" -Verb RunAs
+    exit
+}
+
+# Import required modules
+Import-Module ServerManager -ErrorAction SilentlyContinue
+Import-Module NetLbfo -ErrorAction SilentlyContinue
+Import-Module FailoverClusters -ErrorAction SilentlyContinue
+Import-Module WebAdministration -ErrorAction SilentlyContinue
+
+# Dynamic date/time
+$ReportDate = Get-Date -Format "MMMM dd, yyyy 'at' HH:mm:ss"
+
+# Computer name
+$ComputerName = $env:COMPUTERNAME
+
+# Output file path
+$OutputFile = Join-Path $OutputPath "ServerUpgradeReport.html"
+
+# Function to convert data to HTML table with DataTables
+function ConvertTo-SortableTable {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$InputObject,
+        [string]$TableId,
+        [string]$Title
+    )
+    $pre = "<h3>$Title</h3>"
+    $tableHtml = $InputObject | ConvertTo-Html -Fragment -As Table -PreContent $pre
+    $htmlTable = $tableHtml -replace '<table>', "<table id=`"$TableId`" class=`"table table-striped table-hover`">"
+    return $htmlTable
+}
+
+# Function to get product key (improved method)
+function Get-ProductKey {
+    $map = "BCDFGHJKMPQRTVWXY23456789"
+    $key = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name DigitalProductId).DigitalProductId[0..15]
+    $productKey = ""
+    for ($i = 24; $i -ge 0; $i--) {
+        $r = 0
+        for ($j = 14; $j -ge 0; $j--) { $r = ($r * 256) -bxor $key[$j]; $key[$j] = [math]::Floor($r / 24); $r = $r % 24 }
+        $productKey = $map[$r] + $productKey
+        if (($i % 5 -eq 0) -and ($i -ne 0)) { $productKey = "-" + $productKey }
+    }
+    return $productKey
+}
+
+$productKey = Get-ProductKey
+if ([string]::IsNullOrEmpty($productKey) -or $productKey -eq "-----") {
+    $productKey = "Not Available (Volume License, OEM, or KMS)"
+}
+
+# Start building HTML
+$html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Windows Server Upgrade Diagnostics Report - $ComputerName</title>
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- DataTables CSS -->
+    <link href="https://cdn.datatables.net/1.13.4/css/dataTables.bootstrap5.min.css" rel="stylesheet">
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f8f9fa; }
+        .header { background-color: #007BFF; color: white; padding: 20px; text-align: center; }
+        .logo { max-height: 50px; margin-bottom: 10px; }
+        .card { margin-bottom: 20px; box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075); }
+        .card-header { background-color: #e9ecef; font-weight: bold; }
+        .footer { background-color: #007BFF; color: white; text-align: center; padding: 10px; position: fixed; bottom: 0; width: 100%; }
+        .table th { background-color: #dee2e6; }
+        .table-striped > tbody > tr:nth-of-type(odd) > * { --bs-table-accent-bg: rgba(0, 0, 0, 0.05); }
+        .pre-scrollable { max-height: 400px; overflow-y: auto; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <img src="$LogoUrl" alt="BTCI Logo" class="logo">
+        <h1>Windows Server Upgrade Diagnostics Report</h1>
+        <p><strong>Company:</strong> BTCI | <strong>Prepared by:</strong> Navanath Yenpure | <strong>Generated:</strong> $ReportDate</p>
+        <p><strong>Server:</strong> $ComputerName</p>
+    </div>
+
+    <div class="container-fluid mt-4">
+"@
+
+# Section: OS Build & Edition
+$osInfo = Get-WmiObject -Class Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber, InstallDate, LastBootUpTime, @{Name="TotalMemoryGB";Expression={[math]::Round($_.TotalVisibleMemorySize / 1MB, 2)}}, @{Name="FreeMemoryGB";Expression={[math]::Round($_.FreePhysicalMemory / 1MB, 2)}}
+$osHtml = ConvertTo-SortableTable -InputObject $osInfo -TableId "osTable" -Title "Operating System Information"
+$html += @"
+        <div class="card">
+            <div class="card-header">Operating System Details</div>
+            <div class="card-body">
+                $osHtml
+            </div>
+        </div>
+"@
+
+# Windows Product Key
+$productKeyHtml = "<p><strong>Product Key:</strong> $productKey</p>"
+$html += @"
+        <div class="card">
+            <div class="card-header">Windows Product Key</div>
+            <div class="card-body">
+                $productKeyHtml
+            </div>
+        </div>
+"@
+
+# System Info (systeminfo.exe output)
+$systemInfoRaw = systeminfo
+$systemInfo = $systemInfoRaw -join "`r`n" | ForEach-Object { $_ -replace '<', '&lt;' -replace '>', '&gt;' -replace "`r`n", '<br>' }
+$html += @"
+        <div class="card">
+            <div class="card-header">System Information</div>
+            <div class="card-body">
+                <div class="pre-scrollable">
+                    $systemInfo
+                </div>
+            </div>
+        </div>
+"@
+
+# Network Configuration (ipconfig /all)
+$ipConfigRaw = ipconfig /all
+$ipConfig = $ipConfigRaw -join "`r`n" | ForEach-Object { $_ -replace '<', '&lt;' -replace '>', '&gt;' -replace "`r`n", '<br>' }
+$html += @"
+        <div class="card">
+            <div class="card-header">Network Configuration</div>
+            <div class="card-body">
+                <div class="pre-scrollable">
+                    $ipConfig
+                </div>
+            </div>
+        </div>
+"@
+
+# Installed Roles & Features
+$roles = Get-WindowsFeature | Where-Object { $_.Installed } | Select-Object Name, DisplayName, @{Name="InstallState";Expression={$_.InstallState}} | Sort-Object DisplayName
+if ($roles) {
+    $rolesHtml = ConvertTo-SortableTable -InputObject $roles -TableId "rolesTable" -Title "Installed Roles and Features"
+} else {
+    $rolesHtml = "<p>No roles or features installed on this server.</p>"
+}
+$html += @"
+        <div class="card">
+            <div class="card-header">Installed Roles & Features</div>
+            <div class="card-body">
+                $rolesHtml
+            </div>
+        </div>
+"@
+
+# Installed Hotfixes
+$hotfixes = Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object HotFixID, Description, InstalledOn
+if ($hotfixes) {
+    $hotfixesHtml = ConvertTo-SortableTable -InputObject $hotfixes -TableId "hotfixesTable" -Title "Installed Hotfixes"
+} else {
+    $hotfixesHtml = "<p>No hotfixes installed.</p>"
+}
+$html += @"
+        <div class="card">
+            <div class="card-header">Installed Hotfixes</div>
+            <div class="card-body">
+                $hotfixesHtml
+            </div>
+        </div>
+"@
+
+# Disks, Partitions, Volumes
+$disks = Get-Disk | Select-Object Number, FriendlyName, @{Name="SizeGB";Expression={[math]::Round($_.Size / 1GB, 2)}}, OperationalStatus, HealthStatus
+$disksHtml = ConvertTo-SortableTable -InputObject $disks -TableId "disksTable" -Title "Disks"
+
+$partitions = Get-Partition | Select-Object DiskNumber, PartitionNumber, @{Name="SizeGB";Expression={[math]::Round($_.Size / 1GB, 2)}}, DriveLetter, Type, IsActive
+$partitionsHtml = ConvertTo-SortableTable -InputObject $partitions -TableId "partitionsTable" -Title "Partitions"
+
+$volumes = Get-Volume | Where-Object { $_.DriveLetter } | Select-Object DriveLetter, FileSystem, @{Name="SizeGB";Expression={[math]::Round($_.Size / 1GB, 2)}}, @{Name="SizeRemainingGB";Expression={[math]::Round($_.SizeRemaining / 1GB, 2)}}, HealthStatus, OperationalStatus
+$volumesHtml = ConvertTo-SortableTable -InputObject $volumes -TableId "volumesTable" -Title "Volumes"
+$html += @"
+        <div class="card">
+            <div class="card-header">Storage Information</div>
+            <div class="card-body">
+                $disksHtml
+                $partitionsHtml
+                $volumesHtml
+            </div>
+        </div>
+"@
+
+# Installed Software (from registry for better performance)
+$software = Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | 
+            Where-Object { $_.DisplayName } | 
+            Select-Object DisplayName, DisplayVersion, Publisher, InstallDate | 
+            Where-Object { $_.DisplayName -notmatch '^KB' -and $_.DisplayName -notmatch '^Security Update' } | 
+            Sort-Object DisplayName
+if ($software) {
+    $softwareHtml = ConvertTo-SortableTable -InputObject $software -TableId "softwareTable" -Title "Installed Software"
+} else {
+    $softwareHtml = "<p>No additional software installed.</p>"
+}
+$html += @"
+        <div class="card">
+            <div class="card-header">Installed Software</div>
+            <div class="card-body">
+                $softwareHtml
+            </div>
+        </div>
+"@
+
+# List of Folders in C:\
+$folders = Get-ChildItem C:\ -Directory -ErrorAction SilentlyContinue | Select-Object Name, @{Name="LastWriteTime";Expression={$_.LastWriteTime}}, @{Name="ItemCount";Expression={($_.GetFiles().Count + $_.GetDirectories().Count)}}, FullName | Sort-Object Name
+if ($folders) {
+    $foldersHtml = ConvertTo-SortableTable -InputObject $folders -TableId "foldersTable" -Title "Folders in C:\"
+} else {
+    $foldersHtml = "<p>No folders found in C:\.</p>"
+}
+$html += @"
+        <div class="card">
+            <div class="card-header">C:\ Folders</div>
+            <div class="card-body">
+                $foldersHtml
+            </div>
+        </div>
+"@
+
+# Failover Cluster Details (if applicable)
+$clusterSection = ""
+if (Get-Module -ListAvailable -Name FailoverClusters) {
+    try {
+        $cluster = Get-Cluster
+        $clusterInfo = $cluster | Select-Object Name, Domain, ClusterState
+        $nodes = Get-ClusterNode | Select-Object Name, State, NodeWeight
+        $networks = Get-ClusterNetwork | Select-Object Name, Address, Role
+        $resources = Get-ClusterResource | Select-Object Name, State, OwnerGroup, ResourceType
+
+        $clusterHtml = ConvertTo-SortableTable -InputObject $clusterInfo -TableId "clusterInfoTable" -Title "Cluster Information"
+        $nodesHtml = ConvertTo-SortableTable -InputObject $nodes -TableId "nodesTable" -Title "Cluster Nodes"
+        $networksHtml = ConvertTo-SortableTable -InputObject $networks -TableId "networksTable" -Title "Cluster Networks"
+        $resourcesHtml = ConvertTo-SortableTable -InputObject $resources -TableId "resourcesTable" -Title "Cluster Resources"
+
+        $clusterSection = @"
+                $clusterHtml
+                $nodesHtml
+                $networksHtml
+                $resourcesHtml
+"@
+    } catch {
+        $clusterSection = "<p>No cluster configuration found or access denied.</p>"
+    }
+} else {
+    $clusterSection = "<p>Failover Clustering feature not installed.</p>"
+}
+$html += @"
+        <div class="card">
+            <div class="card-header">Failover Cluster Details</div>
+            <div class="card-body">
+                $clusterSection
+            </div>
+        </div>
+"@
+
+# Network Teaming (LBFO)
+$teamingSection = ""
+if (Get-Module -ListAvailable -Name NetLbfo) {
+    try {
+        $teams = Get-NetLbfoTeam | Select-Object Name, TeamMembers, TeamingMode, LoadBalancingAlgorithm, @{Name="Status";Expression={$_.Status}}
+        if ($teams) {
+            $teamsHtml = ConvertTo-SortableTable -InputObject $teams -TableId "teamsTable" -Title "Network Teaming Configuration"
+            $teamingSection = $teamsHtml
+        } else {
+            $teamingSection = "<p>No teaming configuration found.</p>"
+        }
+    } catch {
+        $teamingSection = "<p>No teaming configuration found.</p>"
+    }
+} else {
+    $teamingSection = "<p>NetLbfo module not available.</p>"
+}
+$html += @"
+        <div class="card">
+            <div class="card-header">Network Teaming</div>
+            <div class="card-body">
+                $teamingSection
+            </div>
+        </div>
+"@
+
+# Network Adapters
+$adapters = Get-NetAdapter | Select-Object Name, InterfaceDescription, DriverVersion, @{Name="LinkSpeed";Expression={$_.LinkSpeed}}, Status, MacAddress
+$adaptersWithVlan = @()
+foreach ($adapter in $adapters) {
+    $vlanProp = Get-NetAdapterAdvancedProperty -Name $adapter.Name -DisplayName "*VLAN*" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $vlan = if ($vlanProp) { $vlanProp.DisplayValue } else { "N/A" }
+    $adapterWithVlan = $adapter | Select-Object *, @{Name="VLAN";Expression={$vlan}}
+    $adaptersWithVlan += $adapterWithVlan
+}
+if ($adaptersWithVlan) {
+    $adaptersHtml = ConvertTo-SortableTable -InputObject $adaptersWithVlan -TableId "adaptersTable" -Title "Network Adapters (with Driver, Speed, VLAN)"
+} else {
+    $adaptersHtml = "<p>No network adapters found.</p>"
+}
+$html += @"
+        <div class="card">
+            <div class="card-header">Network Adapters (with Driver, Speed, VLAN)</div>
+            <div class="card-body">
+                $adaptersHtml
+            </div>
+        </div>
+"@
+
+# Local Users & Groups (without Description)
+$localUsers = Get-LocalUser | Select-Object Name, Enabled, LastLogon, SID
+$usersHtml = ConvertTo-SortableTable -InputObject $localUsers -TableId "usersTable" -Title "Local Users"
+
+$localGroups = @()
+foreach ($group in (Get-LocalGroup)) {
+    $members = (Get-LocalGroupMember -Group $group.Name -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ", "
+    $localGroups += [PSCustomObject]@{
+        Name = $group.Name
+        SID = $group.SID
+        Members = $members
+    }
+}
+$groupsHtml = ConvertTo-SortableTable -InputObject $localGroups -TableId "groupsTable" -Title "Local Groups with Members"
+$html += @"
+        <div class="card">
+            <div class="card-header">Local Users & Groups</div>
+            <div class="card-body">
+                $usersHtml
+                $groupsHtml
+            </div>
+        </div>
+"@
+
+# Scheduled Tasks (only Ready state)
+$tasks = Get-ScheduledTask | Where-Object { $_.State -eq "Ready" -and $_.TaskPath -ne '\Microsoft\Windows\PowerShell\V2\' } | Select-Object TaskName, TaskPath, State, LastRunTime, NextRunTime
+if ($tasks) {
+    $tasksHtml = ConvertTo-SortableTable -InputObject $tasks -TableId "tasksTable" -Title "Scheduled Tasks (Ready State)"
+} else {
+    $tasksHtml = "<p>No scheduled tasks in Ready state found.</p>"
+}
+$html += @"
+        <div class="card">
+            <div class="card-header">Scheduled Tasks (Ready State)</div>
+            <div class="card-body">
+                $tasksHtml
+            </div>
+        </div>
+"@
+
+# Services with Configuration
+$services = Get-WmiObject -Class Win32_Service | Select-Object Name, DisplayName, State, StartMode, PathName, StartName
+if ($services) {
+    $servicesHtml = ConvertTo-SortableTable -InputObject $services -TableId "servicesTable" -Title "Services Configuration"
+} else {
+    $servicesHtml = "<p>No services found.</p>"
+}
+$html += @"
+        <div class="card">
+            <div class="card-header">Services Configuration</div>
+            <div class="card-body">
+                $servicesHtml
+            </div>
+        </div>
+"@
+
+# Certificates (Local Machine Store only)
+$certificates = Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction SilentlyContinue | Select-Object Subject, Thumbprint, NotAfter, NotBefore, Issuer
+if ($certificates) {
+    $certificatesHtml = ConvertTo-SortableTable -InputObject $certificates -TableId "certificatesTable" -Title "Local Machine Certificates"
+} else {
+    $certificatesHtml = "<p>No certificates found in Local Machine Store.</p>"
+}
+$html += @"
+        <div class="card">
+            <div class="card-header">Local Machine Certificates</div>
+            <div class="card-body">
+                $certificatesHtml
+            </div>
+        </div>
+"@
+
+# IIS Application Pools and Websites (if IIS installed)
+$iisSection = ""
+if (Get-Module -ListAvailable -Name WebAdministration) {
+    try {
+        $appPools = Get-Item IIS:\AppPools\* | Select-Object Name, State, ProcessModel, ManagedRuntimeVersion
+        $websites = Get-Website | Select-Object Name, State, PhysicalPath, Bindings
+
+        if ($appPools) {
+            $appPoolsHtml = ConvertTo-SortableTable -InputObject $appPools -TableId "appPoolsTable" -Title "IIS Application Pools"
+        } else {
+            $appPoolsHtml = "<p>No application pools found.</p>"
+        }
+
+        if ($websites) {
+            $websitesHtml = ConvertTo-SortableTable -InputObject $websites -TableId "websitesTable" -Title "IIS Websites"
+        } else {
+            $websitesHtml = "<p>No websites found.</p>"
+        }
+
+        $iisSection = @"
+                $appPoolsHtml
+                $websitesHtml
+"@
+    } catch {
+        $iisSection = "<p>IIS configuration access denied or no details available.</p>"
+    }
+} else {
+    $iisSection = "<p>IIS WebAdministration module not available (IIS not installed).</p>"
+}
+$html += @"
+        <div class="card">
+            <div class="card-header">IIS Application Pools & Websites</div>
+            <div class="card-body">
+                $iisSection
+            </div>
+        </div>
+"@
+
+# Close container
+$html += @"
+    </div>
+
+    <div class="footer">
+        Generated by PreUpgrade-FullInfo.ps1 | BTCI Internal Use Only
+    </div>
+
+    <!-- jQuery -->
+    <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <!-- DataTables JS -->
+    <script src="https://cdn.datatables.net/1.13.4/js/jquery.dataTables.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.4/js/dataTables.bootstrap5.min.js"></script>
+    <script>
+        $(document).ready(function() {
+            // Initialize DataTables for all tables
+            $('table').DataTable({
+                "paging": true,
+                "searching": true,
+                "ordering": true,
+                "info": true,
+                "autoWidth": false,
+                "responsive": true,
+                "pageLength": 25,
+                "dom": 'Bfrtip'  // Add buttons for better UX if needed
+            });
+        });
+    </script>
+</body>
+</html>
+"@
+
+# Write to file
+$html | Out-File -FilePath $OutputFile -Encoding UTF8
+Write-Host "Report generated: $OutputFile" -ForegroundColor Green
