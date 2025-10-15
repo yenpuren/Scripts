@@ -1,0 +1,23 @@
+# Define variables
+$sourcePath = "\\yourserver\share\yourprogram.exe"  # Path to the .exe file on the shared location
+$remotePath = "C:\Temp\yourprogram.exe"             # Path where the .exe will be copied on the remote server
+$servers = Get-Content "C:\path\to\servers.txt"     # Path to the list of server names or IPs
+
+# Run the script for each server
+foreach ($server in $servers) {
+    try {
+        Write-Host "Deploying to $server..."
+
+        # Copy the .exe to the remote server
+        Copy-Item -Path $sourcePath -Destination "\\$server\$remotePath" -Force
+
+        # Run the .exe remotely on the server
+        Invoke-Command -ComputerName $server -ScriptBlock {
+            Start-Process "C:\Temp\yourprogram.exe" -ArgumentList "/silent" -Wait
+        } -Credential (Get-Credential) # If you need to enter credentials for each server
+
+        Write-Host "Deployment to $server completed successfully."
+    } catch {
+        Write-Host "Failed to deploy to $server: $_"
+    }
+}
